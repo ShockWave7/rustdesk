@@ -36,13 +36,13 @@ jobs:
       fail-fast: false
       matrix:
         job:
-          - { target: x86_64-pc-windows-msvc, os: windows-2022, vcpkg-triplet: x64-windows-static, flutter-arch: x64, build-args: "" }
+          - { target: x86_64-pc-windows-msvc, os: windows-2022, arch: x86_64, flutter-arch: x64, vcpkg-triplet: x64-windows-static, build-args: "" }
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      # Автоматическое внедрение сервера и ключа в config.rs
+      # Автоматическое внедрение вашего сервера и ключа
       - name: Inject custom Server and Public Key into config
         shell: bash
         run: |
@@ -88,6 +88,13 @@ jobs:
           EOF
           python3 patch_config.py
 
+      # Восстановление bridge (правильное имя артефакта bridge-artifact)
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
       - name: Install LLVM and Clang
         uses: KyleMayes/install-llvm-action@v2
         with:
@@ -99,9 +106,8 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           targets: ${{ matrix.job.target }}
 
-      # Официальный экшен настройки vcpkg
       - name: Setup vcpkg with Github Actions binary cache
-        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
         with:
           vcpkgDirectory: C:\vcpkg
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
@@ -133,35 +139,38 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           architecture: x64
 
-      - name: Download RustDeskTempTopMostWindow
-        uses: actions/download-artifact@v4
-        with:
-          name: RustDeskTempTopMostWindow-windows-2022-Release-x64
-          path: ./
-
-      - name: Move RustDeskTempTopMostWindow
-        shell: bash
-        run: |
-          mkdir -p flutter/windows/runner/
-          cp RustDeskTempTopMostWindow.exe flutter/windows/runner/
-
-      - name: Download bridge generated files
-        uses: actions/download-artifact@v4
-        with:
-          name: bridge
-          path: ./
-
-      - name: Build Flutter App & Pack Windows
+      # Сборка Flutter приложения
+      - name: Build rustdesk
         shell: bash
         run: |
           export VCPKG_ROOT="$VCPKG_ROOT"
-          python3 build.py --portable --flutter --hwcodec ${{ matrix.job.build-args }}
+          python3 ./build.py --portable --flutter --skip-portable-pack --hwcodec ${{ matrix.job.build-args }}
+          mkdir -p ./rustdesk
+          cp -r ./flutter/build/windows/${{ matrix.job.flutter-arch }}/runner/Release/* ./rustdesk/
 
+      # Загрузка WindowInjection.dll (правильное имя артефакта topmostwindow-artifacts-x64)
+      - name: Download RustDeskTempTopMostWindow artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: topmostwindow-artifacts-x64
+          path: "./rustdesk"
+
+      # Упаковка всего клиента в единый переносимый .exe
+      - name: Build self-extracted executable
+        shell: bash
+        run: |
+          sed -i '/dpiAware/d' res/manifest.xml || true
+          pushd ./libs/portable
+          pip3 install -r requirements.txt
+          python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+          popd
+          mkdir -p ./Output
+          cp ./target/release/rustdesk-portable-packer.exe ./Output/rustdesk-x64.exe || cp ./target/release/*.exe ./Output/rustdesk-x64.exe
+
+      # Сохранение готового файла
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: RustDesk-Windows-x64
           path: |
-            flutter/build/windows/**/Release/*.exe
-            flutter/build/windows/**/Release/*.zip
-            *.exe
+            ./Output/*.exe
