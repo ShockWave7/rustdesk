@@ -7,12 +7,11 @@ on:
       - master # или имя вашей ветки
 
 env:
-  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
   FLUTTER_VERSION: "3.24.5"
   RUST_VERSION: "1.75"
   LLVM_VERSION: "15.0.6"
   UPLOAD_ARTIFACT: "true"
-  # Подключаем ваши секреты
   RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
   RS_PUB_KEY: ${{ secrets.RS_PUB_KEY }}
 
@@ -43,7 +42,7 @@ jobs:
         with:
           submodules: recursive
 
-      # Шаг авто-внедрения сервера и ключа в исходный код
+      # Автоматическое внедрение сервера и ключа в config.rs
       - name: Inject custom Server and Public Key into config
         shell: bash
         run: |
@@ -53,7 +52,6 @@ jobs:
           server = os.environ.get("RENDEZVOUS_SERVER", "").strip()
           key = os.environ.get("RS_PUB_KEY", "").strip()
 
-          # Находим путь к config.rs внутри hbb_common
           config_files = []
           for root, dirs, files in os.walk("."):
               if "config.rs" in files and "hbb_common" in root:
@@ -101,40 +99,32 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           targets: ${{ matrix.job.target }}
 
-      - name: Cache Cargo
-        uses: actions/cache@v4
+      # Официальный экшен настройки vcpkg
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ matrix.job.target }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-${{ matrix.job.target }}-
-
-      - name: Cache vcpkg
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ github.workspace }}/vcpkg/installed
-            ${{ env.LOCALAPPDATA }}/vcpkg/archives
-          key: ${{ runner.os }}-vcpkg-${{ matrix.job.vcpkg-triplet }}-${{ env.VCPKG_COMMIT_ID }}
-
-      - name: Setup vcpkg
-        shell: bash
-        run: |
-          git clone https://github.com/microsoft/vcpkg.git
-          cd vcpkg
-          git checkout ${{ env.VCPKG_COMMIT_ID }}
-          ./bootstrap-vcpkg.bat
-          echo "VCPKG_ROOT=$PWD" >> $GITHUB_ENV
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
 
       - name: Install vcpkg dependencies
         shell: bash
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: ${{ matrix.job.vcpkg-triplet }}
         run: |
-          $VCPKG_ROOT/vcpkg install --triplet ${{ matrix.job.vcpkg-triplet }} --x-install-root="$VCPKG_ROOT/installed"
+          if ! $VCPKG_ROOT/vcpkg \
+            install \
+            --triplet ${{ matrix.job.vcpkg-triplet }} \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
 
       - name: Install Flutter
         uses: subosito/flutter-action@v2
