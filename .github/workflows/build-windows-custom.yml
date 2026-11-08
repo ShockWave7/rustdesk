@@ -1,50 +1,177 @@
-name: Build RustDesk Windows Custom
+name: Build RustDesk Windows Only
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - master # или имя вашей ветки
+
+env:
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  FLUTTER_VERSION: "3.24.5"
+  RUST_VERSION: "1.75"
+  LLVM_VERSION: "15.0.6"
+  UPLOAD_ARTIFACT: "true"
+  # Подключаем ваши секреты
+  RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
+  RS_PUB_KEY: ${{ secrets.RS_PUB_KEY }}
 
 jobs:
-  build-windows:
-    name: Windows x64
-    runs-on: windows-2022
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
 
-    env:
-      RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
-      RS_PUB_KEY: ${{ secrets.RS_PUB_KEY }}
+  build-RustDeskTempTopMostWindow:
+    uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    with:
+      upload-artifact: true
+      target: windows-2022
+      configuration: Release
+      platform: x64
+      target_version: Windows10
 
+  build-for-windows-flutter:
+    name: ${{ matrix.job.target }}
+    needs: [build-RustDeskTempTopMostWindow, generate-bridge]
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { target: x86_64-pc-windows-msvc, os: windows-2022, vcpkg-triplet: x64-windows-static, flutter-arch: x64, build-args: "" }
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      # Шаг авто-внедрения сервера и ключа в исходный код
+      - name: Inject custom Server and Public Key into config
+        shell: bash
+        run: |
+          cat << 'EOF' > patch_config.py
+          import os, re
+
+          server = os.environ.get("RENDEZVOUS_SERVER", "").strip()
+          key = os.environ.get("RS_PUB_KEY", "").strip()
+
+          # Находим путь к config.rs внутри hbb_common
+          config_files = []
+          for root, dirs, files in os.walk("."):
+              if "config.rs" in files and "hbb_common" in root:
+                  config_files.append(os.path.join(root, "config.rs"))
+
+          if not config_files:
+              print("WARNING: config.rs in hbb_common not found!")
+          else:
+              for config_file in config_files:
+                  print(f"Patching {config_file}...")
+                  with open(config_file, "r", encoding="utf-8") as f:
+                      content = f.read()
+
+                  if server:
+                      print(f"Setting RENDEZVOUS_SERVERS -> {server}")
+                      content = re.sub(
+                          r'(pub const RENDEZVOUS_SERVERS:\s*&[^=]+=\s*&\[).*?(\];)',
+                          lambda m: f'{m.group(1)}"{server}"{m.group(2)}',
+                          content,
+                          flags=re.DOTALL
+                      )
+
+                  if key:
+                      print(f"Setting RS_PUB_KEY -> {key}")
+                      content = re.sub(
+                          r'(pub const RS_PUB_KEY:\s*&[^=]+=\s*")[^"]*(";)',
+                          lambda m: f'{m.group(1)}{key}{m.group(2)}',
+                          content
+                      )
+
+                  with open(config_file, "w", encoding="utf-8") as f:
+                      f.write(content)
+                  print("Patch applied successfully.")
+          EOF
+          python3 patch_config.py
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.job.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ matrix.job.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.job.target }}-
+
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/vcpkg/installed
+            ${{ env.LOCALAPPDATA }}/vcpkg/archives
+          key: ${{ runner.os }}-vcpkg-${{ matrix.job.vcpkg-triplet }}-${{ env.VCPKG_COMMIT_ID }}
+
+      - name: Setup vcpkg
+        shell: bash
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          cd vcpkg
+          git checkout ${{ env.VCPKG_COMMIT_ID }}
+          ./bootstrap-vcpkg.bat
+          echo "VCPKG_ROOT=$PWD" >> $GITHUB_ENV
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        run: |
+          $VCPKG_ROOT/vcpkg install --triplet ${{ matrix.job.vcpkg-triplet }} --x-install-root="$VCPKG_ROOT/installed"
 
       - name: Install Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: stable
-          flutter-version: 3.24.5
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install LLVM
-        uses: KyleMayes/install-llvm-action@v2
+      - name: Download RustDeskTempTopMostWindow
+        uses: actions/download-artifact@v4
         with:
-          version: 15.0.6
+          name: RustDeskTempTopMostWindow-windows-2022-Release-x64
+          path: ./
 
-      - name: Build RustDesk
+      - name: Move RustDeskTempTopMostWindow
         shell: bash
         run: |
-          python3 build.py --portable --flutter
+          mkdir -p flutter/windows/runner/
+          cp RustDeskTempTopMostWindow.exe flutter/windows/runner/
 
-      - name: Prepare artifact
+      - name: Download bridge generated files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge
+          path: ./
+
+      - name: Build Flutter App & Pack Windows
         shell: bash
         run: |
-          mkdir rustdesk-release
-          cp -r flutter/build/windows/x64/runner/Release/* rustdesk-release/
+          export VCPKG_ROOT="$VCPKG_ROOT"
+          python3 build.py --portable --flutter --hwcodec ${{ matrix.job.build-args }}
 
-      - name: Upload RustDesk
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: rustdesk-windows-custom
-          path: rustdesk-release
+          name: RustDesk-Windows-x64
+          path: |
+            flutter/build/windows/**/Release/*.exe
+            flutter/build/windows/**/Release/*.zip
+            *.exe
